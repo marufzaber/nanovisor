@@ -80,7 +80,91 @@
 constexpr uint64_t SYS_write = 64;
 constexpr uint64_t SYS_exit  = 93;
 
-int main() {
+// ---------------------------------------------------------------------------
+//  Built-in guest programs.
+//
+//  The default ("hi") is the demo from the README. The others exist as
+//  integration-test fixtures, exercised by ./tests.sh. Selecting a program
+//  is done with `./hyp <name>`. We keep them here, with the rest of the
+//  hand-encoded aarch64, because hand-rolled binaries are not the kind of
+//  thing that benefits from being in a separate file.
+//
+//  Each program is a stream of 32-bit aarch64 instructions placed at guest
+//  PA 0, optionally followed by raw data placed at `data_off`. Every
+//  movz/hvc encoding is verifiable with `clang -target aarch64 -c`.
+// ---------------------------------------------------------------------------
+struct GuestProgram {
+    const char*     name;
+    const uint32_t* code;
+    size_t          code_words;
+    const char*     data;     // nullptr if none
+    size_t          data_off; // guest offset to place `data` at
+    size_t          data_len;
+};
+
+// "hi" — write(1, "hi\n", 3); exit(0). Expected: stdout "hi\n", exit 0.
+static const uint32_t kCodeHi[] = {
+    0xd2800020,   // movz x0, #1
+    0xd2802001,   // movz x1, #0x100
+    0xd2800062,   // movz x2, #3
+    0xd2800808,   // movz x8, #64    (SYS_write)
+    0xd4000002,   // hvc  #0
+    0xd2800000,   // movz x0, #0
+    0xd2800ba8,   // movz x8, #93    (SYS_exit)
+    0xd4000002,   // hvc  #0
+};
+
+// "exit42" — exit(42). Verifies SYS_exit propagates the status all the way
+// to the host process exit code.
+static const uint32_t kCodeExit42[] = {
+    0xd2800540,   // movz x0, #42
+    0xd2800ba8,   // movz x8, #93
+    0xd4000002,   // hvc  #0
+};
+
+// "efault" — write to an out-of-bounds buffer, then exit with whatever
+// write returned. The bounds check inside SYS_write should fire and write
+// -EFAULT to X0, which the guest then passes to SYS_exit. Verifies bounds
+// checking on guest pointers passed to syscalls.
+static const uint32_t kCodeEfault[] = {
+    0xd2800020,   // movz x0, #1
+    0xd2880001,   // movz x1, #0x4000   (one past the mapped page)
+    0xd2800062,   // movz x2, #3
+    0xd2800808,   // movz x8, #64       (SYS_write)
+    0xd4000002,   // hvc  #0            (X0 := -EFAULT)
+    0xd2800ba8,   // movz x8, #93       (SYS_exit; X0 untouched)
+    0xd4000002,   // hvc  #0
+};
+
+// "enosys" — invoke an unimplemented syscall, then exit with what it
+// returned. Verifies the default arm of the dispatch switch.
+static const uint32_t kCodeEnosys[] = {
+    0xd2807ce8,   // movz x8, #999      (unknown syscall)
+    0xd4000002,   // hvc  #0            (X0 := -ENOSYS)
+    0xd2800ba8,   // movz x8, #93       (SYS_exit)
+    0xd4000002,   // hvc  #0
+};
+
+static const GuestProgram kPrograms[] = {
+    {"hi",     kCodeHi,     sizeof(kCodeHi)/4,     "hi\n",  0x100, 3},
+    {"exit42", kCodeExit42, sizeof(kCodeExit42)/4, nullptr, 0,     0},
+    {"efault", kCodeEfault, sizeof(kCodeEfault)/4, nullptr, 0,     0},
+    {"enosys", kCodeEnosys, sizeof(kCodeEnosys)/4, nullptr, 0,     0},
+};
+
+int main(int argc, char** argv) {
+    // Select the guest program. With no argument, run the "hi" demo.
+    const GuestProgram* prog = &kPrograms[0];
+    if (argc > 1) {
+        prog = nullptr;
+        for (const auto& p : kPrograms) {
+            if (std::strcmp(p.name, argv[1]) == 0) { prog = &p; break; }
+        }
+        if (!prog) {
+            std::fprintf(stderr, "unknown program: %s\n", argv[1]);
+            return 2;
+        }
+    }
     // -------------------------------------------------------------------------
     //  STEP 1 / Create the VM.
     //
@@ -105,45 +189,24 @@ int main() {
     if (host_mem == MAP_FAILED) { std::perror("mmap"); return 1; }
 
     // -------------------------------------------------------------------------
-    //  STEP 3 / Lay out the guest program and its data.
+    //  STEP 3 / Lay out the selected guest program in guest RAM.
     //
-    //  We place hand-encoded aarch64 instructions at offset 0, and the
-    //  string "hi\n" at offset 0x100. The instructions follow the Linux
-    //  aarch64 syscall ABI:
+    //  We place hand-encoded aarch64 instructions at offset 0, and (if the
+    //  program has any) raw data at the offset the program asked for. The
+    //  programs themselves live in the `kPrograms` table at the top of the
+    //  file; the canonical "hi" program follows the Linux aarch64 syscall
+    //  ABI:
     //
     //      X8         = syscall number
     //      X0..X5     = arguments
     //      svc/hvc #0 = make the call
     //      X0         = return value (after the call)
-    //
-    //  Disassembly:
-    //
-    //      movz x0, #1         ; fd = 1 (stdout)
-    //      movz x1, #0x100     ; buf = guest address of "hi\n"
-    //      movz x2, #3         ; len = 3
-    //      movz x8, #64        ; SYS_write
-    //      hvc  #0             ; trap to host (commit 2 will switch to svc)
-    //      movz x0, #0         ; status = 0
-    //      movz x8, #93        ; SYS_exit
-    //      hvc  #0
-    //
-    //  Each `movz xD, #imm` encodes as 0xD2800000 | (imm << 5) | D, with
-    //  hw=0 (no shift). hvc #0 is 0xD4000002. You can verify any of these
-    //  with `echo 'movz x0, #1' | clang -target aarch64 -c -x assembler -`
-    //  and `objdump -d`.
     // -------------------------------------------------------------------------
-    const uint32_t guest_code[] = {
-        0xd2800020,   // movz x0, #1
-        0xd2802001,   // movz x1, #0x100
-        0xd2800062,   // movz x2, #3
-        0xd2800808,   // movz x8, #64    (SYS_write)
-        0xd4000002,   // hvc  #0
-        0xd2800000,   // movz x0, #0
-        0xd2800ba8,   // movz x8, #93    (SYS_exit)
-        0xd4000002,   // hvc  #0
-    };
-    std::memcpy(host_mem, guest_code, sizeof(guest_code));
-    std::memcpy((uint8_t*)host_mem + 0x100, "hi\n", 3);
+    std::memcpy(host_mem, prog->code, prog->code_words * sizeof(uint32_t));
+    if (prog->data_len > 0) {
+        std::memcpy((uint8_t*)host_mem + prog->data_off,
+                    prog->data, prog->data_len);
+    }
 
     // -------------------------------------------------------------------------
     //  STEP 4 / Map the host page into the guest's physical address space.

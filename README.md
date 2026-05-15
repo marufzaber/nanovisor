@@ -96,12 +96,25 @@ The Makefile compiles `hyp.cpp` and ad-hoc codesigns the binary with
 the `com.apple.security.hypervisor` entitlement. Without that
 entitlement, `hv_vm_create` returns `HV_DENIED`.
 
+## Tests
+
+```sh
+make test
+```
+
+Runs `tests.sh`, which execs `./hyp` with each of several built-in
+guest programs (see `kPrograms[]` in `hyp.cpp`) and asserts the
+resulting stdout and exit code. Five cases today: happy path, exit-code
+propagation, out-of-bounds buffer rejected with `-EFAULT`, unknown
+syscall rejected with `-ENOSYS`, and bad argv handling.
+
 ## Code tour
 
 | File | What's in it |
 |---|---|
 | `hyp.cpp` | The whole emulator. Heavily commented; read top-to-bottom. |
 | `hyp.entitlements` | Grants `com.apple.security.hypervisor`. Required by macOS. |
+| `tests.sh` | Integration tests; run with `make test`. |
 | `Makefile` | Compile + ad-hoc codesign. |
 
 The 8 numbered steps inside `hyp.cpp` map 1:1 to the lifecycle:

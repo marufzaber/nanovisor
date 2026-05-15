@@ -16,7 +16,10 @@ hyp: hyp.cpp hyp.entitlements
 run: hyp
 	./hyp
 
+test: hyp
+	./tests.sh
+
 clean:
 	rm -f hyp
 
-.PHONY: run clean
+.PHONY: run test clean
